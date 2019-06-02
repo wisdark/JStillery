@@ -687,11 +687,20 @@ var jstiller = (function() {
         value: value
       };
     }
+    if (value === Infinity) {
+      return {
+        type: 'Identifier',
+        name: 'Infinity',
+        pure: true,
+        value: value
+      };
+    }
     if (value < 0) {
       return {
         type: 'UnaryExpression',
         operator: '-',
         value: value,
+        pure: true,
         argument: {
           type: 'Literal',
           pure: true,
@@ -790,7 +799,7 @@ var jstiller = (function() {
   }
 
   function getValue(e) {
-    return typeof e.value !== "undefined" ? e.value : (e.retVal ? e.retVal.value : null);
+    return typeof e.value !== "undefined" ? e.value : e.regex ? new RegExp(e.regex.pattern,e.regex.flags) : (e.retVal ? e.retVal.value : null);
   }
 
   //var incall=false  Added for knowing when we are in a calling state or declarative.
@@ -864,12 +873,14 @@ var jstiller = (function() {
       case 'BinaryExpression':
         var undefObj = {
           "type": "Identifier",
-          "name": "undefined"
+          "name": "undefined",
+          pure: true,
+          value: undefined
         };
 
         left = ast_reduce_scoped(ast.left);
         right = ast_reduce_scoped(ast.right);
-
+        
         if (!right) {
           debug("NO RIGHT!!");
           process.exit(1);
@@ -878,6 +889,7 @@ var jstiller = (function() {
           debug("NO LEFT!!");
           process.exit(1);
         }
+
         if (left.pure && right.pure && ast.operator in boperators) {
           value = mkliteral(boperators[ast.operator](left.value, right.value))
           return value;
@@ -945,12 +957,16 @@ var jstiller = (function() {
                   if (right.property.name === "constructor" || (!scope.closed && scope !== gscope))
                     // if we're in a !expandVars situation we should'n expand undefined values
                     rightV = toString(undefOrObj);
-                  else
+                  else if(!getObjectPath(undefOrObj)){ 
+                  // if cannot get Object path means that it's probably not stringable
+                  // like aa().test+'bb'
+                    rightV = toString(undefOrObj);
+                  } else {
                     rightV = toString(undefObj);
                     // rightV=toString({type: "Identifier",
                     //                    "name": "undefined"
                     //                  });
-
+                  }
                 }
               } else if (right.type !== "ObjectExpression")
                 rightV = toString(right);
@@ -986,8 +1002,13 @@ var jstiller = (function() {
                 } else {
                   if (left.property.name === "constructor" || (!scope.closed && scope !== gscope))
                     leftV = toString(undefOrObj);
-                  else
+                  else if(!getObjectPath(undefOrObj)){ 
+                  // if cannot get Object path means that it's probably not stringable
+                  // like aa().test+'bb'
+                    leftV = toString(undefOrObj);
+                  } else {
                     leftV = toString(undefObj);
+                  }
                 }
               } else if (left.type !== "ObjectExpression")
                 leftV = toString(left);
@@ -1093,6 +1114,9 @@ var jstiller = (function() {
         return ret;
 
       case 'ExpressionStatement':
+        if(ast.expression.type === 'ConditionalExpression'){
+          ast.expression.canbetransformed = true;
+        }
         ret = {
           type: ast.type,
           expression: ast_reduce_scoped(ast.expression)
@@ -1100,6 +1124,29 @@ var jstiller = (function() {
         ret.pure = ret.expression.pure;
         if (ret.expression.expanded) //if expanded property is set to true when we expand Function or eval
           return ast_reduce_scoped(ret.expression)
+        
+        /// Transforms SequenceExpression a,b,c to BlockStatement a;b;c; but only if it is standalone (Ie not in another expression)
+        /*
+        c=3;
+        test,v=4,h=4;
+        -->
+        c = 3;
+        test;
+        v = 4;
+        h = 4;
+        */
+        if(ret.expression.type === 'SequenceExpression' && (parent.type === 'BlockStatement' || parent.type === 'Program')){
+          _tmp = ret.expression.expressions.map(el => {return {type:'ExpressionStatement',expression: el}})
+          ret = {
+            type: 'Program', // This is a hack because we need to return a ast node, and we actually have n nodes in a block.
+                            // so instead of using BlockStatement, which would be rewritten as {.expressions..}, we use Program 
+                            // expressions are not surrounded by brackets.
+            body: _tmp
+          };
+          parent.body[parent.body.indexOf(ast.expression)] = ret;
+          //parent.body.splice.apply(parent.body,[parent.body.indexOf(ast.expression),1].concat(_tmp));
+          return ret;
+        }
 
         return ret;
 
@@ -1131,8 +1178,9 @@ var jstiller = (function() {
 
           } else if (ret.left.type === 'Identifier') {
             _tmp = findScope(ret.left.name, scope);
-            if (((_tmp && _tmp.scope !== scope) /*|| !_tmp not found*/ ) && scope.externalRefs.indexOf(ret.left) !== -1)
-              scope.externalWrite = true;
+            if (((_tmp && _tmp.scope !== scope) /*|| !_tmp not found*/ ) && scope.externalRefs.indexOf(ret.left) !== -1){
+              scope.externalWrite = true;              
+            }
           }
         }
         // *= += etc compound assignment
@@ -1540,8 +1588,15 @@ var jstiller = (function() {
             var _functionast = ast_reduce(_tast, null, true, ast);
             debug("eval _ Finished", _functionast);
             realCallee.evalued = _functionast;
-            if (_functionast.body.length === 1)
-              return _functionast.body[0];
+            if (_functionast.body.length === 1){
+               if(_functionast.body[0].type === 'ExpressionStatement')
+                return _functionast.body[0].expression;
+               else
+                return _functionast.body[0];
+            }
+            else if(_functionast.body.length === 0){
+              return mkliteral(undefined);
+            }
             else
               return { //eval is peculiar, it should be very thoroughly how and when expand it
                 "type": "ExpressionStatement",
@@ -1602,16 +1657,36 @@ var jstiller = (function() {
             ret.arguments.map(getValue));
           return mkliteral(value);
         }
-        var methods1 = ["Date", "escape", "unescape", "encodeURIComponent", "decodeURIComponent", "encodeURI",
-          "decodeURI"];
-        if (realCallee && realCallee.type === "Identifier" && methods1.indexOf(realCallee.name) !== -1) {
+
+        if (match(realCallee, {
+            type: 'Identifier',
+            name: "Date"
+          }) && ret.purearg) {
+          try {
+            value = global["Date"].apply(null,
+              ret.arguments.map(getValue));
+            return mkliteral(value);
+          } catch (e) {}
+        }
+
+        var methods1 = ["escape", "unescape", "encodeURIComponent",
+          "decodeURIComponent", "encodeURI", "decodeURI"];
+        if (realCallee
+          && realCallee.type === "Identifier"
+          && methods1.indexOf(realCallee.name) !== -1) {
+          if (ret.arguments.length) {
+            try {
+              _tmp = toString(ret.arguments[0]);
+            } catch (e) {}
+          }
           if (match(realCallee, {
               type: 'Identifier',
               name: realCallee.name
-            }) && ret.purearg) {
-            value = global[realCallee.name].apply(null,
-              ret.arguments.map(getValue));
-            return mkliteral(value);
+            }) && _tmp) {
+            try {
+              value = global[realCallee.name].call(null, _tmp);
+              return mkliteral(value);
+            } catch (e) {}
           }
         }
 
@@ -1858,7 +1933,7 @@ var jstiller = (function() {
           } else {
             calleeBody.retVal = mkliteral(calleeBody.value);
           }
-        } else if ( /*EXPERIMENTAL!*/ calleeBody && calleeBody.body && calleeBody.body.length === 1 && calleeBody.scope.hasOwnProperty("returns")
+        } else if ( /*EXPERIMENTAL!*/ calleeBody && calleeBody.body && calleeBody.body.length === 1 && calleeBody.body[0].argument && calleeBody.scope.hasOwnProperty("returns")
           && calleeBody.scope.returns === 1) {
           //TODO   We need to copy the function scope and add params values!! tmp_scope = Object.create(calleBody.scope)
           //       Copy all values.
@@ -1989,11 +2064,11 @@ var jstiller = (function() {
                 }
               }
               if (ret.arguments.length < realCallee.resolve_to.params.length) {
-                for (var i = 0, l = realCallee.resolve_to.params.length - ret.arguments.length; i < realCallee.resolve_to.params.length; i++)
-                  ret.arguments.push({
+                for (var i = 0, l = realCallee.resolve_to.params.length - ret.arguments.length; i < l; i++)
+                  ret.arguments.push(mkliteral({
                     type: "Identifier",
                     name: "undefined"
-                  })
+                  }))
               }
               value = {
                 "type": "CallExpression",
@@ -2074,10 +2149,10 @@ var jstiller = (function() {
               }
               if (ret.arguments.length < realCallee.params.length) {
                 for (var i = 0, l = realCallee.params.length - ret.arguments.length; i < realCallee.params.length; i++)
-                  ret.arguments.push({
+                  ret.arguments.push(mkliteral({
                     type: "Identifier",
                     name: "undefined"
-                  })
+                  }))
               }
               debug("***************** Executing function ", genCode(ret), "in sandbox as it's closed***********");
               value = {
@@ -2170,11 +2245,25 @@ var jstiller = (function() {
             if ((parent.type !== 'MemberExpression' || ast.firstObj) && scope.externalRefs.indexOf(ast) === -1)
               scope.externalRefs.push(ast);
           }
-          valFromScope = valFromScope.value;
+          valFromScope = valFromScope.value || {};
           if (valFromScope.value && valFromScope.value.value)
             valFromScope.pure = valFromScope.value.pure;
         } else if (global_vars.indexOf(ast.name) !== -1 && scope.closed !== false) {
           scope.closed = true;
+          debug(ast)
+          if (ast.name === 'undefined' && ast.value === undefined) {
+            ast.value = undefined;
+            ast.pure = true;
+          }
+          if(ast.name === 'Infinity' && ast.value === undefined){
+            ast.value = Infinity;
+            ast.pure = true;
+          }
+          if(ast.name === 'NaN' && ast.value === undefined){
+            ast.value = NaN;
+            ast.pure = true;
+          }
+          
         } else { // Problem, this Ident is called for a.b.c as well as for a 
 
           if ((parent.type !== 'MemberExpression' || ast.firstObj) && scope != gscope) {
@@ -2239,7 +2328,11 @@ var jstiller = (function() {
         })
         ret.simpleType = ret.elements.every(function(a) {
           debug("SIMPLETYPE: ", a); return a.type === "Literal"
-        })
+        });
+/*        ret.elements.forEach((el,index )=> {el.leadingComments=[{
+          type: "block",
+          value: "["+index+"]"
+        }]});*/
         return ret;
 
       case 'ObjectExpression':
@@ -2728,7 +2821,7 @@ var jstiller = (function() {
         }]
         return ret;
 
-
+      case 'ArrowFunctionExpression':
       case 'FunctionExpression':
       //Eg var t=function f(b){cc}  ; t=function f(b){cc} ; (function g(){})..
 
@@ -2781,7 +2874,7 @@ var jstiller = (function() {
           (ret.body && ret.body.body && ret.body.body.length > 0 && ret.body.body[ret.body.body.length - 1].type === "ReturnStatement")) {
           ret.callable = true;
         }
-        ret.leadingComments = [{
+        ret.body.leadingComments = [{
           type: "block",
           value: " Called:" + ast.called + " | Scope Closed:" + fscope.closed +
             (!fscope.closed ? "| writes:" + (fscope.externalWrite ? true : false) : "")
@@ -2828,16 +2921,61 @@ var jstiller = (function() {
 
       case 'ReturnStatement':
         debug('ReturnStatement');
+        if(ast.argument==null){
+          return ast;
+        }
         value = ast_reduce(ast.argument, scope, true, ast);
         scope.returns = scope.hasOwnProperty("returns") ? ++scope.returns : 1;
 
         debug("ReturnStatement :", (value), (ast.argument))
-        ret = {
-          type: 'ReturnStatement',
-          argument: (value && value.pure === true) || scope.closed ? value : ast.argument
-        };
-        ret.pure = ret.argument && (ret.argument.pure || ret.argument.pured || ret.argument.purable || (ret.argument.type === "Identifier" && global_vars.indexOf(ret.argument.name) !== -1));
-
+        if (value.type === 'SequenceExpression') {
+          ret = {
+            type: 'BlockStatement',
+            body: []
+          };
+          value.expressions.forEach(function(el, id) {
+            if (id === value.expressions.length-1){
+              ret.body.push(
+                {
+                  type: 'ReturnStatement',
+                  argument: el,
+                  pure: el && (el.pure || el.pured || el.purable || (el.type === "Identifier" && global_vars.indexOf(el.name) !== -1))
+              });
+            } else
+              ret.body.push({"type": "ExpressionStatement",
+            "expression": el});
+          });
+        } else if(value.type === 'ConditionalExpression'){ 
+          /*
+          rewrites 
+          function e(){return a?r:g;}
+          to
+          function e()
+            {
+                if (a)
+                    return r;
+                else
+                    return g;
+            }
+          */
+          ret = {};
+          ret.type = 'IfStatement';
+          ret.test = value.test;
+          ret.consequent = {
+            type: 'ReturnStatement',
+            argument: value.consequent
+          };
+          ret.alternate = {
+            type: 'ReturnStatement',
+            argument: value.alternate
+          };
+        } else {
+          ret = {
+            type: 'ReturnStatement',
+            argument: (value && value.pure === true) || scope.closed ? value : ast.argument
+          };
+          ret.pure = ret.argument && (ret.argument.pure || ret.argument.pured || ret.argument.purable || (ret.argument.type === "Identifier" && global_vars.indexOf(ret.argument.name) !== -1));
+        }
         debug("RET PURE:", ret.pure, ret.argument === value, ret.argument === ast.argument)
         return ret;
 
@@ -2924,13 +3062,24 @@ var jstiller = (function() {
             type: ast.type
           };
 
-      case 'ConditionalExpression':
+      case 'ConditionalExpression': // a?b:c
         ret = {
           type: ast.type,
+          canbetransformed: ast.canbetransformed || parent.canbetransformed,
           test: ast_reduce_scoped(ast.test), //Expand or Not? Lookahead?
           consequent: ast_reduce_scoped(ast.consequent),
           alternate: ast_reduce_scoped(ast.alternate)
         };
+
+        // if this ternary operator is standalone, we might want to expand it as a if then else
+        if ((parent.type === 'ExpressionStatement' && ast === parent.expression )
+          // OR is the child of another ConditionalExpression 
+            || (parent.type === 'ConditionalExpression' && ast !== parent.test && ret.canbetransformed)
+          ) {
+          ret.type = 'IfStatement';
+        } else {
+          ret.type = ast.type;
+        }
         if (ret.test.pure) {
           if (ret.test.value && ret.consequent.pure) {
             return mkliteral(ret.consequent.value);
@@ -2987,6 +3136,15 @@ var jstiller = (function() {
             ret.arguments.map(getValue));
           return mkliteral(value);
         }
+        // RegExp(X) > /X/i
+        if (match(ret.callee, {
+            type: 'Identifier',
+            name: 'RegExp'
+          }) && ret.purearg) {
+          value = RegExp.apply(null,
+            ret.arguments.map(getValue));
+          return mkliteral(value);
+        }
         if (match(ret.callee, {
             type: "Identifier",
             name: "Date"
@@ -2996,11 +3154,15 @@ var jstiller = (function() {
         return ret;
 
       case 'SequenceExpression':
-        return {
+        ret = {
           type: ast.type,
           expressions: ast.expressions.map(ast_reduce_scoped)
         };
 
+        if(parent.type === 'BlockStatement'){
+          console.log(parent);
+        }
+        return ret;
       case 'UpdateExpression':
         arg = ast_reduce_scoped(ast.argument);
         debug('UpdateExpression', arg, ast.argument)
@@ -3069,10 +3231,77 @@ var jstiller = (function() {
 
       case 'WithStatement': //TODO: Sets this to argument.
         return ast;
-        // TODO: 
 
-      case 'ArrowFunctionExpression':
-        return ast
+      case 'TaggedTemplateExpression':
+         ret = {
+          type: "TaggedTemplateExpression",
+          tag: ast_reduce_scoped(ast.tag),
+          quasi: ast_reduce_scoped(ast.quasi)
+         }
+         _tmp = ast_reduce_scoped({
+              type: "CallExpression",
+              callee: ret.tag,
+              arguments: [ret.quasi]
+            });
+        if(_tmp.type === 'CallExpression')
+          return ret;
+        else
+          return _tmp;
+       break;
+ 
+      case 'TemplateLiteral':
+        // It's the argument of a taggedTemplateExpression 
+        if (parent.quasi && parent.quasi === ast) {
+          // We need to keep the Template Literal
+          // to keep the original behavior of the taggedTemplateExpression
+          // but we reduce all the 
+          ast.quasis.forEach(function(el, id) {
+            if (el.value.cooked) {
+              el.value.raw = el.value.cooked;
+            }
+            if (!el.tail) {
+              ast.expressions[id] = ast_reduce_scoped(ast.expressions[id]);
+            }
+          });
+          return ast;
+        } else {
+          //else we transform it as a string concat.
+          //Some part inspired by https://github.com/babel/babel/blob/master/packages/babel-plugin-transform-template-literals/src/index.js
+          //TODO: complete implementation for: https://github.com/babel/babel/pull/5791
+          _tmp = [mkliteral("")];
+          _trv = ast.expressions.slice(0);
+          ast.quasis.forEach(function(el, id) {
+            if (el.value.cooked) {
+              _tmp.push(mkliteral(el.value.cooked));
+            }
+            if (!el.tail) {
+              _tmp.push(ast_reduce_scoped(_trv[id]));
+            }
+          });
+          ret = {
+            type: "BinaryExpression",
+            left: {},
+            operator: '+',
+            right: _tmp.pop()
+          }
+          _trv = ret;
+          while (_tmp.length) {
+            if (_tmp.length === 1) {
+              _trv.left = _tmp.pop();
+            } else {
+              _trv.left = {
+                type: "BinaryExpression",
+                left: {},
+                operator: '+',
+                right: _tmp.pop()
+              }
+            }
+            _trv = _trv.left;
+          }
+          return ast_reduce_scoped(ret);
+        }
+        break;
+
         // TODO: 
 
       case 'AwaitExpression':
